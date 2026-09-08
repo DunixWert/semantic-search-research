@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Regularization terminology",
+    "query": "L2 weight decay regularization neural network",
+    "expected_paper_ids": ["paper_0e149159c4ef"],
+    "expected_terms": ["weight decay"]
+  },
+  {
+    "name": "Data quality paper discovery",
+    "query": "data quality machine learning tasks",
+    "expected_paper_ids": ["paper_cd36b65217a4"],
+    "expected_terms": ["data quality"]
+  },
+  {
+    "name": "PV review discovery",
+    "query": "photovoltaic power forecasting comprehensive review",
+    "expected_paper_ids": ["paper_ded0c33ba5aa"],
+    "expected_terms": ["forecast"]
+  }
+]

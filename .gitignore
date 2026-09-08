@@ -1,0 +1,25 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing and environments
+.pytest_cache/
+.venv/
+env/
+venv/
+
+# Local configuration and preferences
+ui_preferences.json
+
+# Local research library data (papers, DB, and caches should not be committed)
+*.sqlite3
+*.sqlite3-journal
+LiteratureLibrary/
+search_cache/
+logs/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini

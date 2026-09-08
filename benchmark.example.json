@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Temporal evaluation",
+    "query": "How should forecasting models avoid temporal leakage during evaluation?",
+    "expected_paper_ids": ["paper_replace_me"],
+    "expected_terms": ["rolling origin", "time series cross-validation"]
+  },
+  {
+    "name": "PV ramp events",
+    "query": "Can nearby solar sites help predict cloud-driven ramps?",
+    "expected_paper_ids": ["paper_replace_me"],
+    "expected_terms": ["ramp", "spatial"]
+  }
+]
