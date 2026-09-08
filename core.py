@@ -22,10 +22,61 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import Normalizer
+from .validation import (CHECK_VERSION, ASSESSMENT_VERSION, checks_stale,
+                         comparable_title, first_page_supports_title, integrity_check)
 
 
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
 VALID_STATUSES = {"accepted", "rejected", "needs_review"}
+
+# ── Auto-screen keyword patterns ──────────────────────────────────────────────
+# A paper whose title matches ACCEPT_TITLE_KW and has any lexical overlap with
+# the research question is considered a safe auto-accept.
+_ACCEPT_TITLE_KW = re.compile(
+    r"\b("
+    r"solar|photovoltaic|pv\b|irradiance|insolation|"
+    r"renewable energy|wind energy|energy grid|grid.connected|load.shedding|"
+    r"forecasting|forecast|prediction|short.term.*power|"
+    r"lstm|long short.term|recurrent neural|convolutional neural|deep learning|"
+    r"machine learning.*energy|neural network.*forecast|"
+    r"energy drought|res drought|"
+    r"frequency stability|power system|grid integration|inverter|"
+    r"dropout.*recurrent|bayesian.*neural|artificial neural network.*forecast|"
+    r"behind.the.meter|distributed energy resource"
+    r")\b",
+    re.I,
+)
+
+# A paper whose title matches REJECT_TITLE_KW is rejected regardless of score
+# (prevents LSA false-positives from irrelevant books with incidental word overlap).
+_REJECT_TITLE_KW = re.compile(
+    r"\b("
+    r"positivism|comte\b|critical social theory|organization studies|"
+    r"intrusion detection|ids\b|cyber.security|cybersecurity|"
+    r"agile method|scrum|kanban|"
+    r"knowledge management.*dark data|"
+    r"qualitative methodology|qualitative research"
+    r")\b",
+    re.I,
+)
+
+# Junk title patterns produced by poor PDF extraction (table-of-contents, editorial
+# metadata, textbook passages with no real title).
+_JUNK_TITLE_RE = re.compile(
+    r"^("
+    r"nec;|"
+    r"crispmwp|"
+    r"pii:\s*s\d|"
+    r"introduction\s+\.{3,}|"
+    r"peer.review under responsibility|"
+    r"for carrying out data mining|"
+    r"average weight update per gradient|"
+    r"the stochastic gradient descent|"
+    r"history:\s*received|"
+    r"this paper is to be presented"
+    r")",
+    re.I,
+)
 
 
 def utc_now() -> str:
@@ -38,7 +89,12 @@ def normalize_doi(value: str | None) -> str | None:
     value = urllib.parse.unquote(value).strip().lower()
     value = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", value)
     match = DOI_RE.search(value)
-    return match.group(0).rstrip(".,;:)]}>") if match else None
+    if not match:
+        return None
+    result = match.group(0).rstrip('.,;:]}>' )
+    while result.endswith(')') and result.count(')') > result.count('('):
+        result = result[:-1]
+    return result
 
 
 def normalize_title(value: str) -> str:
@@ -333,21 +389,30 @@ class Library:
         doi = paper.get("doi")
         if not doi:
             report = {"verified": False, "state": "missing_doi", "reason": "No DOI recorded. Identity can be checked against the original source."}
+            report.update(check_version=CHECK_VERSION, checked_at=utc_now(), integrity={
+                'state': 'unknown', 'flagged': False, 'reason': 'No DOI to query. This is not evidence of unreliability.', 'notices': []})
             return self._save_verification(paper_id, report)
         url = "https://api.crossref.org/works/" + urllib.parse.quote(doi, safe="")
         try:
-            response = requests.get(url, timeout=timeout, headers={"User-Agent": "LocalLiteratureLibrary/0.1 (mailto:local@example.invalid)"})
+            response = requests.get(url, timeout=timeout, headers={"User-Agent": "LocalLiteratureLibrary/0.2"})
             if response.status_code != 200:
                 report = {"verified": False, "state": "not_found" if response.status_code == 404 else "unavailable",
                           "reason": f"Crossref returned HTTP {response.status_code}", "doi": doi}
             else:
                 message = response.json()["message"]
+                if not isinstance(message, dict) or not isinstance(message.get('title'), list) or not message['title']:
+                    raise ValueError('Missing or malformed Crossref title')
                 remote_title = " ".join(message.get("title") or [])
                 remote_authors = ", ".join(
                     " ".join(filter(None, [a.get("given"), a.get("family")])) for a in message.get("author", [])
                 )
-                title_score = self._text_similarity(paper["title"], remote_title)
-                verified = title_score >= 0.72
+                title_score = self._text_similarity(comparable_title(paper["title"]), comparable_title(remote_title))
+                try:
+                    page_one = self.text(paper_id, 1)['text']
+                except (OSError, KeyError):
+                    page_one = ''
+                page_match = first_page_supports_title(remote_title, page_one)
+                verified = bool(remote_title) and (title_score >= 0.72 or page_match)
                 date_parts = (message.get("published-print") or message.get("published-online") or message.get("issued") or {}).get("date-parts", [[]])
                 report = {
                     "verified": verified,
@@ -355,16 +420,70 @@ class Library:
                     "reason": "DOI resolved and title matched" if verified else "DOI resolved but title metadata needs review",
                     "doi": doi,
                     "title_similarity": round(title_score, 3),
+                    "match_basis": 'metadata_title' if title_score >= 0.72 else 'first_page_title' if page_match else None,
                     "local_title": paper["title"],
                     "crossref_title": remote_title,
                     "crossref_authors": remote_authors,
                     "crossref_year": date_parts[0][0] if date_parts and date_parts[0] else None,
                     "crossref_venue": " ".join(message.get("container-title") or []),
                     "crossref_url": message.get("URL"),
+                    "integrity": integrity_check(message, doi) if verified else {
+                        'state': 'identity_unconfirmed', 'flagged': False,
+                        'reason': 'The DOI title did not match this PDF. Notices on that DOI cannot safely be attributed to this paper.',
+                        'notices': [],
+                    },
                 }
-        except requests.RequestException as exc:
+        except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as exc:
             report = {"verified": False, "state": "unavailable", "reason": f"Verification unavailable: {exc.__class__.__name__}", "doi": doi}
+        report.update(check_version=CHECK_VERSION, checked_at=utc_now())
+        report.setdefault('integrity', {'state': 'unknown', 'flagged': False,
+            'reason': 'Identity lookup is incomplete; no integrity conclusion is available.', 'notices': []})
+        previous = paper.get('verification', {})
+        if report['state'] == 'unavailable' and previous.get('integrity', {}).get('flagged'):
+            # A temporary outage must not erase a previously observed notice.
+            report['integrity'] = dict(previous['integrity'], retained_from=previous.get('checked_at'),
+                reason=previous['integrity']['reason'] + ' Latest lookup failed; this is the previously observed alert.')
         return self._save_verification(paper_id, report)
+
+    def refresh_checks(self, paper_id=None, *, stale_only=True, reassess=True,
+                       timeout=15, cancelled=None, progress=None):
+        """Rerun versioned checks without modifying researcher decisions or PDFs.
+
+        Persist one paper at a time so cancellation/failure preserves completed work.
+        Relevance reports are refreshed once per distinct recorded question.
+        """
+        papers = [self.show(paper_id)] if paper_id else self.list_papers()
+        result = {'check_version': CHECK_VERSION, 'refreshed': [], 'skipped': [],
+                  'errors': [], 'cancelled': False}
+        for index, paper in enumerate(papers):
+            if cancelled and cancelled():
+                result['cancelled'] = True
+                break
+            current = self.show(paper['id'])
+            questions = {}
+            for assessment in current['assessments']:
+                questions.setdefault(assessment['question'], assessment['report'])
+            identity_due = not stale_only or checks_stale(current)
+            questions_due = [q for q, r in questions.items() if not stale_only or r.get('assessment_version') != ASSESSMENT_VERSION] if reassess else []
+            if not identity_due and not questions_due:
+                result['skipped'].append(paper['id'])
+                continue
+            if progress:
+                progress(index + 1, len(papers), paper['title'])
+            try:
+                report = self.verify(paper['id'], timeout=timeout) if identity_due else current['verification']
+                completed_questions = 0
+                for question in questions_due:
+                    if cancelled and cancelled():
+                        result['cancelled'] = True
+                        break
+                    self.assess(paper['id'], question)
+                    completed_questions += 1
+                result['refreshed'].append({'paper_id': paper['id'], 'state': report.get('state'),
+                    'integrity': report.get('integrity', {}), 'assessment_questions': completed_questions})
+            except (ValueError, KeyError, OSError) as exc:
+                result['errors'].append({'paper_id': paper['id'], 'error': str(exc)})
+        return result
 
     def _save_verification(self, paper_id: str, report: dict) -> dict:
         with self.connect() as conn:
@@ -584,6 +703,8 @@ class Library:
                 "match": row,
                 "warning": "NEEDS REVIEW" if row["status"] == "needs_review" else None,
                 "identity_verified": bool(verification.get("verified")),
+                "integrity": verification.get('integrity', {'state': 'not_checked', 'flagged': False}),
+                "checks_stale": checks_stale({'verification': verification}),
             })
 
         latency_ms = (time.perf_counter() - start_time) * 1000
@@ -603,9 +724,16 @@ class Library:
     def assess(self, paper_id: str, question: str, evidence_limit: int = 5) -> dict:
         evidence = self.search(question, limit=evidence_limit, paper_id=paper_id, caller="assess")
         best = evidence[0]["score"] if evidence else 0.0
+        # Tiny single-paper SVD spaces can assign high similarity to an entirely
+        # out-of-vocabulary query. Such a score is not positive relevance evidence.
+        if not any(item.get('lexical_score', 0) > 0 for item in evidence):
+            best = 0.0
         confidence = min(0.95, max(0.05, best * 2.2))
-        verdict = "accept" if best >= 0.16 else "review" if best >= 0.07 else "reject"
+        verdict = "accept" if best >= 0.16 else "review"
         report = {
+            "assessment_version": ASSESSMENT_VERSION,
+            "is_reliability_assessment": False,
+            "relevance": 'potential_match' if best >= 0.16 else 'inspect_further' if best >= 0.07 else 'weak_match',
             "question": question,
             "recommended_verdict": verdict,
             "confidence": round(confidence, 3),
@@ -621,7 +749,113 @@ class Library:
             self._event(conn, paper_id, "assessed", {"question": question, "verdict": verdict})
         return report
 
+    def auto_screen(self, paper_id: str, question: str) -> dict:
+        """Screen a single paper using title keywords + assess() score.
+
+        Returns a structured recommendation dict with keys:
+            verdict       : 'accept' | 'reject' | 'manual'
+            reason        : human-readable explanation
+            score         : best assess() score (0.0 if junk/missing)
+            lexical_score : lexical component of top passage score
+            title         : paper title as stored
+            paper_id      : paper_id
+
+        The caller is responsible for calling decide() — this method never
+        modifies paper status.
+        """
+        paper = self.show(paper_id)
+        title = paper["title"]
+
+        # ── Junk title → hard reject ─────────────────────────────────────────
+        if _JUNK_TITLE_RE.search(title):
+            return {
+                "verdict": "reject",
+                "reason": f"Junk or metadata-artefact title detected: '{title[:80]}'",
+                "score": 0.0, "lexical_score": 0.0,
+                "title": title, "paper_id": paper_id,
+            }
+
+        # ── Off-topic keyword in title → reject (overrides score) ────────────
+        reject_hit = _REJECT_TITLE_KW.search(title)
+        if reject_hit:
+            return {
+                "verdict": "reject",
+                "reason": f"Off-topic domain keyword '{reject_hit.group()}' found in title.",
+                "score": 0.0, "lexical_score": 0.0,
+                "title": title, "paper_id": paper_id,
+            }
+
+        # ── Run assess for this paper ─────────────────────────────────────────
+        report = self.assess(paper_id, question)
+        evidence = report.get("evidence", [])
+        score = evidence[0]["score"] if evidence else 0.0
+        lexical = evidence[0].get("lexical_score", 0.0) if evidence else 0.0
+
+        # ── Title accept keyword + any relevance signal → accept ──────────────
+        accept_hit = _ACCEPT_TITLE_KW.search(title)
+        if accept_hit and (score >= 0.03 or lexical > 0):
+            return {
+                "verdict": "accept",
+                "reason": (
+                    f"Relevant title keyword '{accept_hit.group()}' confirmed by "
+                    f"retrieval score={score:.3f} (lexical={lexical:.3f})."
+                ),
+                "score": score, "lexical_score": lexical,
+                "title": title, "paper_id": paper_id,
+            }
+
+        # ── High score alone (accept keyword missed by regex) ─────────────────
+        if score >= 0.16 and lexical > 0:
+            return {
+                "verdict": "accept",
+                "reason": f"High retrieval score={score:.3f} (lexical={lexical:.3f}) with research question.",
+                "score": score, "lexical_score": lexical,
+                "title": title, "paper_id": paper_id,
+            }
+
+        # ── Everything else → manual ──────────────────────────────────────────
+        return {
+            "verdict": "manual",
+            "reason": (
+                f"Score={score:.3f} (lexical={lexical:.3f}). "
+                "No strong title keyword match and score below auto-accept threshold. "
+                "Inspect page text before deciding."
+            ),
+            "score": score, "lexical_score": lexical,
+            "title": title, "paper_id": paper_id,
+        }
+
+    def batch_auto_screen(self, question: str, status: str = "needs_review",
+                          progress=None) -> dict:
+        """Run auto_screen() on all papers with the given status.
+
+        Returns:
+            {
+              "accept":  [list of auto_screen result dicts],
+              "reject":  [...],
+              "manual":  [...],
+            }
+        Does NOT call decide() — caller applies decisions.
+        """
+        papers = self.list_papers(status=status)
+        results: dict[str, list] = {"accept": [], "reject": [], "manual": []}
+        for index, paper in enumerate(papers):
+            if progress:
+                progress(index + 1, len(papers), paper["title"])
+            try:
+                rec = self.auto_screen(paper["id"], question)
+                results[rec["verdict"]].append(rec)
+            except Exception as exc:
+                results["manual"].append({
+                    "verdict": "manual",
+                    "reason": f"Screening error: {exc}",
+                    "score": 0.0, "lexical_score": 0.0,
+                    "title": paper["title"], "paper_id": paper["id"],
+                })
+        return results
+
     def decide(self, paper_id: str, status: str, reason: str) -> dict:
+
         if status not in VALID_STATUSES:
             raise ValueError(f"Status must be one of: {', '.join(sorted(VALID_STATUSES))}")
         with self.connect() as conn:
